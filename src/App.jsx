@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AnimatePresence, motion, useMotionValue, useTransform } from 'framer-motion'
-import { dateGate, experience } from './content'
+import { AnimatePresence, motion, useMotionValue, useTransform, useReducedMotion } from 'framer-motion'
+import { dateGate, experience, previewAccess } from './content'
+import LivingSketch from './components/LivingSketch'
+import MemoryJar from './components/MemoryJar'
 
 const spring = { type: 'spring', stiffness: 260, damping: 26, mass: 0.8 }
 
@@ -29,6 +31,31 @@ function timeUntil(now) {
     minutes: Math.floor((difference % 3600000) / 60000),
     seconds: Math.floor((difference % 60000) / 1000),
   }
+}
+
+function hasPreviewPassword() {
+  const path = window.location.pathname.replace(/\/+$/, '') || '/'
+  if (path !== '/admin/pass') return false
+
+  const rawQuery = window.location.search.slice(1)
+  const namedPassword = new URLSearchParams(window.location.search).get('password')
+  return (namedPassword || rawQuery) === previewAccess.password
+}
+
+function initialView() {
+  if (!hasPreviewPassword()) return 'deck'
+  const requestedView = new URLSearchParams(window.location.search).get('view')
+  return ['deck', 'letter', 'garden', 'wish', 'sketch', 'final', 'jar'].includes(requestedView) ? requestedView : 'deck'
+}
+
+function previewStartsOpen() {
+  return hasPreviewPassword() && new URLSearchParams(window.location.search).get('open') === 'true'
+}
+
+function previewSketchPage() {
+  if (!hasPreviewPassword()) return 0
+  const page = Number(new URLSearchParams(window.location.search).get('page'))
+  return Number.isInteger(page) && page >= 1 && page <= 3 ? page - 1 : 0
 }
 
 function Ambient() {
@@ -83,11 +110,14 @@ function Card({ card, index, active, onDismiss, onUnfold, hasInteracted }) {
   </motion.article>
 }
 
-function Deck({ unfold }) {
+function Deck({ unfold, jarDiscovered, openJar }) {
   const [current, setCurrent] = useState(0)
   const [touched, setTouched] = useState(false)
   const visibleCards = useMemo(() => experience.cards.slice(current, current + 3).reverse(), [current])
   return <main className="deck-shell">
+    {jarDiscovered && <motion.button className="love-jar-shortcut" type="button" onClick={openJar} initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: .35, duration: .5 }}>
+      <i aria-hidden="true"><span /></i>{experience.jar.shortcutLabel}
+    </motion.button>}
     <div className="deck" aria-label="Birthday messages">{visibleCards.map((card, reversedIndex) => {
       const absoluteIndex = current + (visibleCards.length - 1 - reversedIndex)
       return <Card key={absoluteIndex} card={card} index={absoluteIndex} active={absoluteIndex === current} onDismiss={() => setCurrent(n => Math.min(n + 1, experience.cards.length - 1))} onUnfold={unfold} hasInteracted={() => setTouched(true)} />
@@ -96,17 +126,13 @@ function Deck({ unfold }) {
 }
 
 function Letter({ openGarden }) {
-  const [open, setOpen] = useState(false)
   return <motion.main className="letter-screen" initial={{ clipPath: 'inset(45% 20% round 28px)', opacity: .4 }} animate={{ clipPath: 'inset(0% 0% round 0px)', opacity: 1 }} transition={{ duration: .85, ease: [0.22, 1, .36, 1] }}>
     <motion.div className="letter" initial="hidden" animate="show" variants={{ hidden: {}, show: { transition: { staggerChildren: .48, delayChildren: .55 } } }}>
       <motion.p className="letter-to" variants={{ hidden: { opacity: 0, y: 12 }, show: { opacity: 1, y: 0 } }}>{experience.recipient},</motion.p>
       {experience.letter.map((line, i) => <motion.p className="letter-line" key={i} variants={{ hidden: { opacity: 0, y: 18 }, show: { opacity: 1, y: 0, transition: { duration: .8, ease: [0.22, 1, .36, 1] } } }}>{line}</motion.p>)}
       <motion.p className="letter-signature" variants={{ hidden: { opacity: 0, y: 12 }, show: { opacity: 1, y: 0 } }}>{experience.signature}</motion.p>
       <motion.div className="keepsake-wrap" variants={{ hidden: { opacity: 0, y: 10 }, show: { opacity: 1, y: 0 } }}>
-        <motion.button className="keepsake-seal" type="button" aria-label="Open a final note" onClick={() => setOpen(true)} animate={open ? { rotate: 8, scale: 1.03 } : { scale: [1, 1.04, 1] }} transition={open ? spring : { duration: 3.8, repeat: Infinity, ease: 'easeInOut' }}>
-          <span>{open ? 'S' : '✦'}</span>
-        </motion.button>
-        <AnimatePresence>{open && <motion.p className="keepsake-note" initial={{ opacity: 0, y: 9 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: .6 }}>{experience.keepsake}</motion.p>}</AnimatePresence>
+        <p className="keepsake-note">{experience.keepsake}</p>
       </motion.div>
       <motion.button className="garden-entry" type="button" onClick={openGarden} variants={{ hidden: { opacity: 0, y: 10 }, show: { opacity: 1, y: 0 } }}>
         one more small thing <span>→</span>
@@ -172,17 +198,137 @@ function Garden({ returnToLetter, goNext }) {
   </motion.main>
 }
 
-function WishPage({ returnToGarden, complete }) {
+// 15 candles in 3 offset rings (back/mid/front) so candles never stack at
+// the same x across rings — that's what makes the 3D depth read correctly.
+// 6 strawberries are scattered across the same 3 depths so they're not
+// all bunched at the front rim. Every x/y pair is derived from the
+// frosting ellipse so nothing can sit outside the cake surface. Items are
+// sorted by depth (smaller = further back) so the painter's algorithm
+// draws back items first, giving correct occlusion.
+const cakeItems = (() => {
+  const cx = 180, rxT = 118, ryT = 40, cyTop = 158
+  const out = []
+
+  const candleRings = [
+    { depth: 0.2,  columns: [-0.66, -0.32, 0,     0.32,  0.66], scale: 0.88 }, // back ring (smallest, furthest away)
+    { depth: 0.5,  columns: [-0.84, -0.42, 0,     0.42,  0.84], scale: 0.98 }, // middle ring (widest spread)
+    { depth: 0.82, columns: [-0.66, -0.32, 0,     0.32,  0.66], scale: 1.06 }, // front ring (largest, nearest)
+  ]
+  let candleIdx = 0
+  for (const ring of candleRings) {
+    const depthSigned = ring.depth * 2 - 1
+    for (const fx of ring.columns) {
+      const x = cx + rxT * fx
+      const halfH = ryT * Math.sqrt(1 - fx * fx)
+      const y = cyTop + depthSigned * halfH
+      out.push({
+        kind: 'candle',
+        x, y, scale: ring.scale,
+        color: ['rose', 'cream', 'gold'][candleIdx % 3],
+        depth: ring.depth,
+        candleIdx,
+      })
+      candleIdx++
+    }
+  }
+
+  const berrySpecs = [
+    { fx: -0.5,  depth: 0.3,  r: -7, scale: 0.85 }, // back-left berry
+    { fx:  0.5,  depth: 0.3,  r:  7, scale: 0.85 }, // back-right berry
+    { fx: -0.74, depth: 0.55, r: -8, scale: 0.9  }, // mid-left berry (between candles)
+    { fx:  0.74, depth: 0.55, r:  8, scale: 0.9  }, // mid-right berry
+    { fx: -0.45, depth: 0.78, r: -5, scale: 0.95 }, // front-left berry
+    { fx:  0.45, depth: 0.78, r:  5, scale: 0.95 }, // front-right berry
+  ]
+  berrySpecs.forEach((s, i) => {
+    const x = cx + rxT * s.fx
+    const halfH = ryT * Math.sqrt(1 - s.fx * s.fx)
+    const depthSigned = s.depth * 2 - 1
+    const y = cyTop + depthSigned * halfH
+    out.push({
+      kind: 'berry',
+      x, y, scale: s.scale, r: s.r,
+      depth: s.depth,
+      berryIdx: i,
+    })
+  })
+
+  // Painter's algorithm: smaller depth (further back) drawn first.
+  out.sort((a, b) => a.depth - b.depth)
+  return out
+})()
+
+function Candle({ item, wished, reduceMotion }) {
+  const fill = item.color === 'rose'
+    ? 'url(#rose-candle)'
+    : item.color === 'cream'
+      ? 'url(#cream-candle)'
+      : 'url(#gold-candle)'
+  return <g transform={`translate(${item.x} ${item.y}) scale(${item.scale})`}>
+    <ellipse cx="1" cy="4" rx="9" ry="3.2" fill="#76564c" opacity=".2" transform="rotate(8)" />
+    <rect x="-5" y="-40" width="10" height="44" rx="3" fill={fill} stroke="#6b4f47" strokeOpacity=".18" />
+    <path d="M-4-30 4-24M-4-18 4-12" stroke="#fff" strokeOpacity=".34" strokeWidth="2" strokeLinecap="round" />
+    <ellipse cx="0" cy="-38" rx="5.2" ry="2.1" fill="none" stroke="#ead0c1" strokeWidth="2.4" opacity=".9" />
+    <path d="M0-40L0-47" stroke="#51443e" strokeWidth="1.8" strokeLinecap="round" />
+    <g transform="translate(0 -47)">
+      <AnimatePresence>{!wished && <motion.path key="flame" className="cake-flame" d="M0 0C-7-7-4-17 0-23C4-17 7-7 0 0Z" fill="url(#flame-fill)" initial={{ opacity: 0 }} animate={reduceMotion ? { opacity: 1 } : { opacity: 1, scaleY: [.9, 1.12, .96, 1.05, .9], scaleX: [1, .92, 1.04, .94, 1] }} exit={{ opacity: 0, scale: .25 }} transition={reduceMotion ? { duration: .2 } : { opacity: { duration: .2 }, duration: 1.1 + (item.candleIdx % 4) * .12, repeat: Infinity, ease: 'easeInOut' }} style={{ transformBox: 'fill-box', transformOrigin: '50% 100%' }} />}</AnimatePresence>
+      {wished && <motion.path key="smoke" d="M0 0C-5-6 5-11 0-17C-5-23 5-28 0-34" fill="none" stroke="#8a827b" strokeWidth="2" strokeLinecap="round" initial={{ opacity: .5, pathLength: 0 }} animate={{ opacity: 0, pathLength: 1, y: -12 }} transition={{ duration: 1.4 + (item.candleIdx % 3) * .15, delay: item.candleIdx * .02, ease: 'easeOut' }} />}
+    </g>
+  </g>
+}
+
+function Berry({ item }) {
+  return <g transform={`translate(${item.x} ${item.y}) rotate(${item.r}) scale(${item.scale})`}>
+    <ellipse cx="0" cy="3" rx="14" ry="4.5" fill="#825e53" opacity=".22" />
+    <path d="M0 4C-12-7-13-22 0-29 13-22 12-7 0 4Z" fill="#b9575d" stroke="#8f4149" strokeWidth="1" />
+    <path d="M-8-24 0-34 8-24M-10-26 0-22 10-26" fill="#7d9273" stroke="#657a60" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    <circle cx="-4" cy="-14" r="1" fill="#f1c49c" /><circle cx="4" cy="-8" r="1" fill="#f1c49c" /><circle cx="2" cy="-20" r="1" fill="#f1c49c" />
+  </g>
+}
+
+function WishPage({ returnToGarden, continueJourney }) {
   const [wished, setWished] = useState(false)
+  const reduceMotion = useReducedMotion()
   return <motion.main className="wish-screen" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} transition={{ duration: .55 }}>
     <button className="return-letter" type="button" onClick={returnToGarden}>garden</button>
-    <button className="complete-page" type="button" onClick={complete}>Complete <span>→</span></button>
+    <button className="complete-page" type="button" onClick={continueJourney}>Next <span aria-hidden="true">→</span></button>
     <div className="wish-copy"><p>{experience.wish.title}</p><span>{wished ? experience.wish.complete : experience.wish.prompt}</span></div>
-    <motion.button className={`candle-scene ${wished ? 'candle-wished' : ''}`} type="button" aria-label="Make a wish" onClick={() => setWished(true)} whileTap={{ scale: .95 }}>
-      <motion.i className="candle-glow" animate={wished ? { scale: [1, 1.7], opacity: [.45, 0] } : { scale: [1, 1.13, 1], opacity: [.28, .5, .28] }} transition={{ duration: wished ? 1.4 : 2.4, repeat: wished ? 0 : Infinity, ease: 'easeInOut' }} />
-      {!wished && <motion.i className="flame" animate={{ scaleY: [.9, 1.14, .92], rotate: [-3, 3, -3] }} transition={{ duration: 1.6, repeat: Infinity, ease: 'easeInOut' }} />}
-      {wished && <motion.i className="ember" initial={{ y: 0, opacity: 1, scale: 1 }} animate={{ y: -190, opacity: 0, scale: .35, x: 18 }} transition={{ duration: 2.3, ease: [0.22, 1, .36, 1] }} />}
-      <i className="wick" /><i className="candle" /><i className="candle-base" />
+    <motion.button className={`cake-scene ${wished ? 'cake-wished' : ''}`} type="button" aria-label="Make a wish and blow out 15 candles" onClick={() => setWished(true)} whileTap={wished ? undefined : { scale: .975 }}>
+      <svg className="birthday-cake-svg" viewBox="0 0 360 360" role="img" aria-hidden="true">
+        <defs>
+          <linearGradient id="plate-top" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#fffaf2" /><stop offset=".5" stopColor="#ecdfce" /><stop offset="1" stopColor="#cdb79f" /></linearGradient>
+          <linearGradient id="plate-side" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#dcc9b2" /><stop offset="1" stopColor="#a98c74" /></linearGradient>
+          <linearGradient id="cake-side" x1="0" y1="0" x2="1" y2="0"><stop stopColor="#b98471" /><stop offset=".18" stopColor="#efd0bb" /><stop offset=".5" stopColor="#f8e2ce" /><stop offset=".82" stopColor="#ddb49e" /><stop offset="1" stopColor="#aa7567" /></linearGradient>
+          <radialGradient id="frosting-top" cx="38%" cy="24%" r="78%"><stop stopColor="#fffdf7" /><stop offset=".56" stopColor="#f6e0d3" /><stop offset="1" stopColor="#cfa18f" /></radialGradient>
+          <linearGradient id="cream-band" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#fff5e8" /><stop offset=".58" stopColor="#efd2c2" /><stop offset="1" stopColor="#d99ca1" /></linearGradient>
+          <linearGradient id="rose-candle" x1="0" y1="0" x2="1" y2="0"><stop stopColor="#ba6e78" /><stop offset=".45" stopColor="#e7aeb2" /><stop offset=".72" stopColor="#f1c9c5" /><stop offset="1" stopColor="#a95e69" /></linearGradient>
+          <linearGradient id="cream-candle" x1="0" y1="0" x2="1" y2="0"><stop stopColor="#c7ac73" /><stop offset=".5" stopColor="#fff0c7" /><stop offset="1" stopColor="#b99558" /></linearGradient>
+          <linearGradient id="gold-candle" x1="0" y1="0" x2="1" y2="0"><stop stopColor="#a77f45" /><stop offset=".5" stopColor="#e9cb8c" /><stop offset="1" stopColor="#97703c" /></linearGradient>
+          <radialGradient id="flame-fill" cx="50%" cy="72%" r="70%"><stop stopColor="#fffce3" /><stop offset=".33" stopColor="#f4ce72" /><stop offset=".76" stopColor="#cf7f50" /><stop offset="1" stopColor="#cf7f50" stopOpacity="0" /></radialGradient>
+          <filter id="cake-shadow-filter" x="-30%" y="-30%" width="160%" height="180%"><feGaussianBlur stdDeviation="7" /></filter>
+          <filter id="soft-depth" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="6" stdDeviation="5" floodColor="#5d4137" floodOpacity=".2" /></filter>
+          <clipPath id="cake-body-clip"><path d="M62 158L62 270A118 40 0 0 0 298 270L298 158A118 40 0 0 1 62 158Z" /></clipPath>
+        </defs>
+        <ellipse cx="180" cy="332" rx="150" ry="15" fill="#5d4b42" opacity=".17" filter="url(#cake-shadow-filter)" />
+        <path d="M20 284A164 44 0 0 0 340 284L340 298A164 44 0 0 1 20 298Z" fill="url(#plate-side)" />
+        <ellipse cx="180" cy="284" rx="164" ry="44" fill="url(#plate-top)" stroke="#c2ab93" strokeWidth="1.2" />
+        <g filter="url(#soft-depth)">
+          <path d="M62 158L62 270A118 40 0 0 0 298 270L298 158A118 40 0 0 1 62 158Z" fill="url(#cake-side)" />
+        </g>
+        <g clipPath="url(#cake-body-clip)">
+          <path d="M82 158V286" stroke="#fff" strokeOpacity=".16" strokeWidth="16" />
+        </g>
+        <ellipse cx="180" cy="158" rx="118" ry="40" fill="url(#frosting-top)" stroke="#c99a88" strokeWidth="1.4" />
+        <g clipPath="url(#cake-body-clip)">
+          <path d="M62 158A118 40 0 0 1 298 158L298 206C276 224 256 206 236 220C214 234 196 212 176 224C156 234 138 212 118 222C100 232 80 214 62 206Z" fill="url(#cream-band)" />
+        </g>
+        <path d="M62 158A118 40 0 0 1 298 158" fill="none" stroke="#fff" strokeOpacity=".5" strokeWidth="4" strokeLinecap="round" />
+        {cakeItems.map((item) => item.kind === 'candle' ? (
+          <Candle key={`candle-${item.candleIdx}`} item={item} wished={wished} reduceMotion={reduceMotion} />
+        ) : (
+          <Berry key={`berry-${item.berryIdx}`} item={item} />
+        ))}
+      </svg>
     </motion.button>
   </motion.main>
 }
@@ -199,12 +345,15 @@ function CatPair() {
   </motion.svg>
 }
 
-function FinalPage() {
+function FinalPage({ openJar }) {
   return <motion.main className="final-screen" initial={{ clipPath: 'inset(15% 15% round 35px)', opacity: .2 }} animate={{ clipPath: 'inset(0% 0% round 0px)', opacity: 1 }} transition={{ duration: .85, ease: [0.22, 1, .36, 1] }}>
     <motion.div className="final-copy" initial="hidden" animate="show" variants={{ hidden: {}, show: { transition: { staggerChildren: .35, delayChildren: .35 } } }}>
       <motion.h1 variants={{ hidden: { opacity: 0, y: 16 }, show: { opacity: 1, y: 0 } }}>{experience.final.title}</motion.h1>
       {experience.final.lines.map(line => <motion.p key={line} variants={{ hidden: { opacity: 0, y: 15 }, show: { opacity: 1, y: 0 } }}>{line}</motion.p>)}
       <motion.em variants={{ hidden: { opacity: 0, y: 10 }, show: { opacity: 1, y: 0 } }}>{experience.final.signoff}</motion.em>
+      <motion.button className="jar-entry" type="button" onClick={openJar} variants={{ hidden: { opacity: 0, y: 10 }, show: { opacity: 1, y: 0 } }}>
+        {experience.final.jarLabel} <span aria-hidden="true">→</span>
+      </motion.button>
     </motion.div>
     <CatPair />
   </motion.main>
@@ -216,13 +365,30 @@ function Teaser({ now }) {
 }
 
 export default function App() {
-  const [view, setView] = useState('deck')
+  const [view, setView] = useState(initialView)
   const [now, setNow] = useState(() => Date.now())
+  const [previewUnlocked, setPreviewUnlocked] = useState(() => localStorage.getItem(previewAccess.storageKey) === 'true' || hasPreviewPassword())
+  const [jarDiscovered, setJarDiscovered] = useState(() => localStorage.getItem(experience.jar.storageKey) === 'true')
   useEffect(() => {
     if (!dateGate.enabled) return undefined
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [])
+  useEffect(() => {
+    if (!hasPreviewPassword()) return
+    localStorage.setItem(previewAccess.storageKey, 'true')
+    setPreviewUnlocked(true)
+  }, [])
+  useEffect(() => {
+    if (view !== 'jar') return
+    localStorage.setItem(experience.jar.storageKey, 'true')
+    setJarDiscovered(true)
+  }, [view])
+  const openJar = () => {
+    localStorage.setItem(experience.jar.storageKey, 'true')
+    setJarDiscovered(true)
+    setView('jar')
+  }
   const gated = beforeBirthday(now)
-  return <div className="app min-h-[100svh] overflow-hidden text-stone-800"><Ambient /><AnimatePresence mode="wait">{gated ? <Teaser key="teaser" now={now} /> : view === 'final' ? <FinalPage key="final" /> : view === 'wish' ? <WishPage key="wish" returnToGarden={() => setView('garden')} complete={() => setView('final')} /> : view === 'garden' ? <Garden key="garden" returnToLetter={() => setView('letter')} goNext={() => setView('wish')} /> : view === 'letter' ? <Letter key="letter" openGarden={() => setView('garden')} /> : <Deck key="deck" unfold={() => setView('letter')} />}</AnimatePresence></div>
+  return <div className="app min-h-[100svh] overflow-hidden text-stone-800"><Ambient /><AnimatePresence mode="wait">{gated && !previewUnlocked ? <Teaser key="teaser" now={now} /> : view === 'jar' ? <MemoryJar key="jar" returnToFinal={() => setView('final')} /> : view === 'final' ? <FinalPage key="final" openJar={openJar} /> : view === 'sketch' ? <LivingSketch key="sketch" initiallyOpen={previewStartsOpen()} initialPage={previewSketchPage()} returnToWish={() => setView('wish')} finish={() => setView('final')} /> : view === 'wish' ? <WishPage key="wish" returnToGarden={() => setView('garden')} continueJourney={() => setView('sketch')} /> : view === 'garden' ? <Garden key="garden" returnToLetter={() => setView('letter')} goNext={() => setView('wish')} /> : view === 'letter' ? <Letter key="letter" openGarden={() => setView('garden')} /> : <Deck key="deck" unfold={() => setView('letter')} jarDiscovered={jarDiscovered} openJar={openJar} />}</AnimatePresence></div>
 }
